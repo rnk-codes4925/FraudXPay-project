@@ -147,12 +147,22 @@ if st.button("🔍 Predict", use_container_width=True):
             X_tf       = input_data.values
             feat_names = list(input_data.columns)
 
-        # SHAP values
-        explainer   = shap.TreeExplainer(classifier)
-        shap_values = explainer.shap_values(X_tf)
+        # SHAP — auto-detect model type and pick the right explainer
+        from sklearn.linear_model import LogisticRegression, LinearRegression
+        from sklearn.svm import SVC, SVR
 
-        # Binary classifier → list of two arrays → pick fraud class (index 1)
-        sv = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
+        if isinstance(classifier, (LogisticRegression, LinearRegression)):
+            # LinearExplainer works for linear models — needs a background dataset
+            background = np.zeros((1, X_tf.shape[1]))
+            explainer   = shap.LinearExplainer(classifier, background,
+                                               feature_perturbation="interventional")
+            shap_values = explainer.shap_values(X_tf)
+            # LinearExplainer returns a single array (not a list)
+            sv = shap_values[0] if shap_values.ndim == 2 else shap_values
+        else:
+            explainer   = shap.TreeExplainer(classifier)
+            shap_values = explainer.shap_values(X_tf)
+            sv = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
 
         n  = min(len(sv), len(feat_names))
         shap_df = pd.DataFrame({"Feature": feat_names[:n], "SHAP": sv[:n]})
@@ -194,23 +204,74 @@ if st.button("🔍 Predict", use_container_width=True):
                 st.markdown(f"- **{row['Feature']}** lowered fraud probability by `{abs(row['SHAP']):.4f}`")
 
     except Exception as e:
-        # Fallback: raw feature importances from the model
-        st.warning("Showing model feature importances (SHAP could not run — see note below).")
+        # Fallback: use coef_ (Logistic Regression) or feature_importances_ (tree models)
+        st.warning("Showing model coefficients as feature impact chart.")
         try:
-            clf = model.named_steps[list(model.named_steps.keys())[-1]]
-            imp = clf.feature_importances_
+            from sklearn.pipeline import Pipeline
+            step_names  = list(model.named_steps.keys())
+            clf         = model.named_steps[step_names[-1]]
+
+            # Get transformed feature names for the fallback chart
+            if len(step_names) > 1:
+                pre_steps    = [(k, model.named_steps[k]) for k in step_names[:-1]]
+                preprocessor = Pipeline(pre_steps)
+                X_fb         = preprocessor.transform(input_data)
+                try:
+                    fb_names = list(preprocessor.get_feature_names_out())
+                except Exception:
+                    fb_names = [f"feature_{i}" for i in range(X_fb.shape[1])]
+            else:
+                fb_names = list(input_data.columns)
+
+            # Pick coef_ for linear models, feature_importances_ for tree models
+            if hasattr(clf, "coef_"):
+                imp    = clf.coef_[0]          # Logistic Regression coefficients
+                x_label = "Coefficient (positive = more fraud risk)"
+                colors  = ["#e74c3c" if v > 0 else "#3498db" for v in imp]
+            elif hasattr(clf, "feature_importances_"):
+                imp    = clf.feature_importances_
+                x_label = "Feature Importance"
+                colors  = "#4a90d9"
+            else:
+                raise ValueError("Model has no coef_ or feature_importances_.")
+
+            n   = min(len(imp), len(fb_names))
             fi_df = pd.DataFrame({
-                "Feature":    list(input_data.columns)[:len(imp)],
-                "Importance": imp[:len(input_data.columns)],
-            }).sort_values("Importance", ascending=False)
+                "Feature": fb_names[:n],
+                "Value":   imp[:n],
+            }).reindex(pd.Series(imp[:n]).abs().sort_values(ascending=False).index)
 
             fig2 = go.Figure(go.Bar(
-                x=fi_df["Importance"], y=fi_df["Feature"],
-                orientation="h", marker_color="#4a90d9"
+                x            = fi_df["Value"],
+                y            = fi_df["Feature"],
+                orientation  = "h",
+                marker_color = colors if isinstance(colors, list) else [colors]*n,
+                text         = [f"{v:+.4f}" for v in fi_df["Value"]],
+                textposition = "outside",
             ))
-            fig2.update_layout(yaxis={"autorange": "reversed"}, height=300,
-                               xaxis_title="Importance", plot_bgcolor="white")
+            fig2.add_vline(x=0, line_width=1, line_color="black")
+            fig2.update_layout(
+                xaxis_title  = x_label,
+                yaxis        = {"autorange": "reversed"},
+                height       = max(300, n * 48),
+                margin       = dict(t=20, b=30, l=10, r=80),
+                plot_bgcolor = "white",
+            )
             st.plotly_chart(fig2, use_container_width=True)
-            st.caption(f"ℹ️ SHAP note: {e}")
-        except Exception:
-            st.info(f"Could not generate explanation. Error: {e}")
+
+            # Plain-English from coefficients
+            st.markdown("**📋 In plain English** (based on model coefficients):")
+            coef_df   = fi_df.copy()
+            risk_rows = coef_df[coef_df["Value"] > 0].head(3)
+            safe_rows = coef_df[coef_df["Value"] < 0].head(2)
+            if not risk_rows.empty:
+                st.markdown("🔴 **Features that increase fraud risk:**")
+                for _, row in risk_rows.iterrows():
+                    st.markdown(f"- **{row['Feature']}** — coefficient `{row['Value']:+.4f}`")
+            if not safe_rows.empty:
+                st.markdown("🔵 **Features that reduce fraud risk:**")
+                for _, row in safe_rows.iterrows():
+                    st.markdown(f"- **{row['Feature']}** — coefficient `{row['Value']:+.4f}`")
+
+        except Exception as e2:
+            st.info(f"Could not generate explanation. Error: {e2}")
